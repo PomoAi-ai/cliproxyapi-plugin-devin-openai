@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.env.*
+auths/
+secrets/
+*.key
+*.pem
+*.log
+*.dylib
+*.so
+*.dll
+devin-openai.h
+__pycache__/
+.venv/
+dist/
+build/
