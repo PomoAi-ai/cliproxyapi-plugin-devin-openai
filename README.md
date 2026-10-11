@@ -112,6 +112,14 @@ uv run --no-project python3 tools/verify_host.py \
 - Messages API 到 OpenAI 网关的非流式工具调用与结果转换。
 - 系统提示内容、工具 ID 和结果保留，上游 403 明确返回。
 
-这些检查覆盖插件接入和协议传递；尚未验证真实 Devin 登录、网关账号权益、Linux 动态库加载，或 Claude Code/OpenCode 的实际 subagent 端到端任务。
+另已验证 CI 构建的 Linux amd64 动态库可由 CPA v8.0.23 热加载，管理接口确认注册、启用和 OAuth 能力。
+
+这些检查覆盖插件接入和协议传递；尚未验证真实 Devin 登录、网关账号权益，或 Claude Code/OpenCode 的实际 subagent 端到端任务。
+
+## Linux 构建产物
+
+在 GitHub Actions 手动运行 `Build Linux plugin`，成功后下载 `devin-openai-linux-amd64` artifact，包含 `devin-openai.so` 和 `SHA256SUMS`。编译使用 Go 1.25.1 / Debian 12，仅支持 Linux amd64；安装前运行 `sha256sum -c SHA256SUMS`。
+
+全局插件已启用时，将动态库放到 `<plugins.dir>/linux/amd64/devin-openai.so`，再通过管理认证调用 `PATCH /v0/management/plugins/devin-openai/enabled`，请求体为 `{"enabled":true}`，即可触发热加载。通过 `GET /v8/management/plugins` 确认 `registered`、`effective_enabled`、`supports_oauth` 均为 `true`。单独停用该插件时将 enabled 改为 false。
 
 发布采用获授权后的 CI/CD 构建；这里没有创建发布包、镜像或自动部署流程，也没有将测试加入 CI。

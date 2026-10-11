@@ -1,6 +1,6 @@
 # FIX -- Linux plugin build
 
-## Status: verifying
+## Status: done
 ## Task: 002
 ## Related: N/A
 ## Baseline Commit: 89b90a2
@@ -18,4 +18,11 @@ The initial implementation was verified locally on macOS; the Linux host needs a
 
 ## Verification
 - [x] Review workflow commands: build and checksum only, no tests or deployment credentials.
-- [ ] GitHub Actions build succeeds and artifact checksum matches.
+- [x] GitHub Actions build succeeds and artifact checksum matches.
+
+## Results
+- Build run: https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai/actions/runs/38135901447
+- Source: 08c3c810d9d5f41c819694fe5b230df4050f58fc.
+- SHA256: b44ef5c382b05dd5534da2f429f4288ce8ed173ca60fce13107f7d54efc8c182.
+- Manual Linux amd64 CPA v8.0.23 loading check confirmed registered, effective_enabled and supports_oauth.
+- No CI tests, real model calls, or credentials in workflow/artifact.
