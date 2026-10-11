@@ -18,6 +18,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p dist
           go build -trimpath -buildmode=c-shared -o dist/devin-openai.so .
           cd dist
