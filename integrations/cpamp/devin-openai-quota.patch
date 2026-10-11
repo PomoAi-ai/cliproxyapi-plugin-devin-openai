@@ -401,6 +401,136 @@
      const quota = getCredentialScopedQuotaState(stores.devinQuota, file);
      if (!quota) return emptyQuota(filePlanType);
      const planType = quota.plan ?? filePlanType;
+--- a/apps/web/src/features/accounts/model/accountRows.test.ts
++++ b/apps/web/src/features/accounts/model/accountRows.test.ts
+@@ -115,6 +115,82 @@
+   );
+ 
+ describe('accountRows', () => {
++  it.each([0, 5, 96])(
++    'keeps gateway health metrics and filters unconfirmed with %s percent seat quota until real success',
++    (remainingPercent) => {
++      const file: AuthFileItem = {
++        name: 'gateway.json',
++        type: 'devin-openai',
++        authIndex: 'gateway-account',
++      };
++      const stores = emptyStores();
++      stores.devinQuota[getQuotaCredentialStoreKey(file)] = {
++        ...buildQuotaCredentialIdentity(file),
++        status: 'success',
++        windows: [
++          { id: 'daily', remainingPercent, resetAtMs: null, periodHours: 24 },
++          { id: 'weekly', remainingPercent, resetAtMs: null, periodHours: 168 },
++        ],
++        observedAtMs: 2_000,
++        fetchedAtMs: 2_000,
++        plan: 'Max',
++        planStartMs: null,
++        planEndMs: null,
++      };
++      const [row] = buildAccountRows([file], stores);
++      const baseFilters = { provider: 'all', plan: 'all', quotaBand: 'all' as const, search: '' };
++      expect(buildAccountMetrics([row])).toMatchObject({
++        available: 0,
++        quotaRisk: 0,
++        unconfirmed: 1,
++      });
++      expect(filterAccountRows([row], { ...baseFilters, status: 'unconfirmed' })).toHaveLength(1);
++      for (const status of ['available', 'low', 'exhausted'] as const) {
++        expect(filterAccountRows([row], { ...baseFilters, status })).toHaveLength(0);
++      }
++      const requestEvidenceBySelectionKey = new Map([
++        [row.selectionKey, { latestRequest: { timestamp_ms: 3_000, failed: false } }],
++      ]);
++      expect(buildAccountMetrics([row], { requestEvidenceBySelectionKey })).toMatchObject({
++        available: 1,
++        quotaRisk: 0,
++        unconfirmed: 0,
++      });
++      expect(
++        filterAccountRows([row], {
++          ...baseFilters,
++          status: 'available',
++          requestEvidenceBySelectionKey,
++        })
++      ).toHaveLength(1);
++      const [inspected] = buildAccountRows([file], stores, [
++        {
++          id: 1,
++          runId: 1,
++          accountKey: file.name,
++          fileName: file.name,
++          displayAccount: file.name,
++          provider: 'devin-openai',
++          authIndex: 'gateway-account',
++          disabled: false,
++          action: 'keep',
++          actionReason: 'healthy',
++          statusCode: 200,
++          isQuota: false,
++          createdAtMs: 3_000,
++        },
++      ]);
++      expect(buildAccountMetrics([inspected])).toMatchObject({
++        available: 1,
++        quotaRisk: 0,
++        unconfirmed: 0,
++      });
++      expect(filterAccountRows([inspected], { ...baseFilters, status: 'available' })).toHaveLength(
++        1
++      );
++    }
++  );
++
+   it('suppresses only handled inspection authentication results for the reauthenticated identity', () => {
+     const authenticationResult: AccountInspectionResult = {
+       id: 1,
+--- a/apps/web/src/features/accounts/model/accountRows.ts
++++ b/apps/web/src/features/accounts/model/accountRows.ts
+@@ -636,8 +636,8 @@
+ };
+ 
+ const hasAccountQuotaRisk = (row: AccountRow, context: AccountMetricOperationalContext): boolean =>
+-  row.quota.status === 'low' ||
+-  row.quota.status === 'exhausted' ||
++  (row.provider !== 'devin-openai' &&
++    (row.quota.status === 'low' || row.quota.status === 'exhausted')) ||
+   hasAccountQuotaLimitEvidence(
+     row,
+     getRowRequestEvidenceInput(row, context.requestEvidenceBySelectionKey)
+@@ -651,7 +651,9 @@
+ ): boolean => {
+   const requestEvidence = getRowRequestHealthEvidence(row, context.requestEvidenceBySelectionKey);
+   return (
+-    (row.quota.status === 'ok' && hasCurrentAccountQuotaEvidence(row)) ||
++    (row.provider !== 'devin-openai' &&
++      row.quota.status === 'ok' &&
++      hasCurrentAccountQuotaEvidence(row)) ||
+     isAccountInspectionHealthyEvidence(row) ||
+     (isAccountRequestHealthEvidenceCurrent(row, requestEvidence) &&
+       requestEvidence?.kind === 'success')
+@@ -713,7 +715,7 @@
+     !resolveAccountAuthenticationProblemEvidence(row, requestEvidence) &&
+     !hasAccountQuotaLimitEvidence(row, requestEvidenceInput) &&
+     !isAccountQuotaRefreshProblemCurrent(row, requestEvidence) &&
+-    row.quota.status !== 'exhausted' &&
++    (row.provider === 'devin-openai' || row.quota.status !== 'exhausted') &&
+     !isAccountObservedDiagnosticProblemCurrent(row, requestEvidence) &&
+     !isAccountInspectionActionable(row, requestEvidence) &&
+     currentRequestEvidence?.direction !== 'negative' &&
+@@ -929,8 +931,9 @@
+       currentRequestEvidence?.direction === 'negative'
+     );
+   }
+-  if (status === 'low') return row.quota.status === 'low';
+-  if (status === 'exhausted') return row.quota.status === 'exhausted';
++  if (status === 'low') return row.provider !== 'devin-openai' && row.quota.status === 'low';
++  if (status === 'exhausted')
++    return row.provider !== 'devin-openai' && row.quota.status === 'exhausted';
+   if (status === 'inspection') {
+     return isAccountInspectionActionable(
+       row,
 --- a/apps/web/src/features/accounts/model/accountsPagePresentation.ts
 +++ b/apps/web/src/features/accounts/model/accountsPagePresentation.ts
 @@ -784,6 +784,11 @@
