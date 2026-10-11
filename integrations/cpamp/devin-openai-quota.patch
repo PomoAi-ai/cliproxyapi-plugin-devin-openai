@@ -1,0 +1,729 @@
+--- a/apps/web/src/components/quota/index.ts
++++ b/apps/web/src/components/quota/index.ts
+@@ -4,6 +4,7 @@
+   CODEX_CONFIG,
+   CODEX_SUMMARY_CONFIG,
+   DEVIN_CONFIG,
++  DEVIN_OPENAI_CONFIG,
+   KIMI_CONFIG,
+   META_CONFIG,
+   XAI_CONFIG,
+--- a/apps/web/src/components/quota/quotaConfigs.ts
++++ b/apps/web/src/components/quota/quotaConfigs.ts
+@@ -1,4 +1,5 @@
+ import type { TFunction } from 'i18next';
++import { fetchDevinOpenaiQuota } from '@/utils/quota/devinOpenaiQuota';
+ import type {
+   AntigravityQuotaState,
+   AuthFileItem,
+@@ -60,7 +61,15 @@
+   scopeQuotaStateToCredential,
+ } from '@/utils/quota/credentialScope';
+ 
+-type QuotaType = 'antigravity' | 'claude' | 'codex' | 'kimi' | 'xai' | 'devin' | 'meta';
++type QuotaType =
++  | 'antigravity'
++  | 'claude'
++  | 'codex'
++  | 'kimi'
++  | 'xai'
++  | 'devin'
++  | 'devin-openai'
++  | 'meta';
+ 
+ export type { QuotaFetchContext };
+ 
+@@ -869,6 +878,12 @@
+   scopeState: scopeCredentialQuotaState,
+ };
+ 
++export const DEVIN_OPENAI_CONFIG: QuotaConfig<DevinQuotaState, DevinQuotaData> = {
++  ...DEVIN_CONFIG,
++  type: 'devin-openai',
++  fetchQuota: fetchDevinOpenaiQuota,
++};
++
+ export const META_CONFIG: QuotaConfig<MetaQuotaState, MetaQuotaData> = {
+   type: 'meta',
+   i18nPrefix: 'meta_quota',
+--- a/apps/web/src/features/accounts/AccountsPage.test.tsx
++++ b/apps/web/src/features/accounts/AccountsPage.test.tsx
+@@ -17,9 +17,11 @@
+   XAI_CONFIG,
+ } from '@/components/quota';
+ import { accountQuotaSnapshotApi, type ApiCallResult } from '@/services/api';
++import { apiClient } from '@/services/api/client';
+ import type {
+   AuthFileItem,
+   CodexQuotaState,
++  DevinQuotaState,
+   CodexRateLimitResetCredit,
+   MetaQuotaData,
+   OAuthModelAliasEntry,
+@@ -18534,6 +18536,79 @@
+   });
+ 
+   describe('responsive quota presentation and split codex refresh flows', () => {
++    it('refreshes a Devin OpenAI account from empty quota into daily and weekly windows through the plugin API', async () => {
++      const file: AuthFileItem = {
++        name: 'gateway.json',
++        type: 'devin-openai',
++        authIndex: 'gateway-account',
++      };
++      const other: AuthFileItem = {
++        name: 'other.json',
++        type: 'devin-openai',
++        authIndex: 'other-account',
++      };
++      mocks.files = [file, other];
++      const post = vi.spyOn(apiClient, 'post').mockResolvedValue({
++        subscription: { plan: 'Pro' },
++        groups: [
++          {
++            buckets: [
++              { window: 'daily', remainingFraction: 0 },
++              { window: 'weekly', remainingFraction: 0.75 },
++            ],
++          },
++        ],
++      });
++      mocks.quotaState.setDevinQuota.mockImplementation(
++        (
++          update:
++            | Record<string, DevinQuotaState>
++            | ((current: Record<string, DevinQuotaState>) => Record<string, DevinQuotaState>)
++        ) => {
++          const current = mocks.quotaState.devinQuota as Record<string, DevinQuotaState>;
++          mocks.quotaState.devinQuota = typeof update === 'function' ? update(current) : update;
++        }
++      );
++      const renderer = await renderAccountsPage();
++      await flushPromises();
++      const key = getAuthFileSelectionKey(file);
++      expect(
++        findAccountCardByKey(renderer, key).findAllByProps({
++          'data-account-quota-window': 'devin-openai:daily',
++        })
++      ).toHaveLength(0);
++      await act(async () => {
++        await findAccountCardButtonByAriaLabel(
++          renderer,
++          key,
++          'accounts.refresh_quota'
++        ).props.onClick();
++      });
++      await flushPromises();
++      await act(async () => {
++        renderer.update(<AccountsPage />);
++      });
++      await flushPromises();
++      expect(post).toHaveBeenCalledTimes(1);
++      expect(post).toHaveBeenCalledWith(
++        '/plugins/devin-openai/quota',
++        { auth_index: 'gateway-account' },
++        expect.any(Object)
++      );
++      const card = findAccountCardByKey(renderer, key);
++      expect(
++        readText(card.findByProps({ 'data-account-quota-window': 'devin-openai:daily' }))
++      ).toContain('0%');
++      expect(
++        readText(card.findByProps({ 'data-account-quota-window': 'devin-openai:weekly' }))
++      ).toContain('75%');
++      expect(
++        findAccountCardByKey(renderer, getAuthFileSelectionKey(other)).findAllByProps({
++          'data-account-quota-window': 'devin-openai:daily',
++        })
++      ).toHaveLength(0);
++    });
++
+     it('calls full detail refresh on single row refresh for Codex', async () => {
+       const file = makeCodexFile('codex-row-summary.json', 'auth-detail-1', 'detail@example.com');
+       mocks.files = [file];
+--- a/apps/web/src/features/accounts/AccountsPage.tsx
++++ b/apps/web/src/features/accounts/AccountsPage.tsx
+@@ -52,6 +52,7 @@
+   CODEX_CONFIG,
+   CODEX_SUMMARY_CONFIG,
+   DEVIN_CONFIG,
++  DEVIN_OPENAI_CONFIG,
+   KIMI_CONFIG,
+   META_CONFIG,
+   XAI_CONFIG,
+@@ -3061,6 +3062,9 @@
+         case DEVIN_CONFIG.type:
+           prune(DEVIN_CONFIG, setDevinQuota);
+           break;
++        case DEVIN_OPENAI_CONFIG.type:
++          prune(DEVIN_OPENAI_CONFIG, setDevinQuota);
++          break;
+         case META_CONFIG.type:
+           prune(META_CONFIG, setMetaQuota);
+           break;
+@@ -3936,7 +3940,8 @@
+           }
+           break;
+         }
+-        case DEVIN_CONFIG.type: {
++        case DEVIN_CONFIG.type:
++        case DEVIN_OPENAI_CONFIG.type: {
+           const state = getCredentialScopedQuotaState(baseQuotaStores.devinQuota, row.raw);
+           if (state?.status === 'success' && state.windows.length > 0) {
+             fetchedAtMs = state.fetchedAtMs ?? state.observedAtMs ?? undefined;
+@@ -6493,6 +6498,14 @@
+               getScopedQuotaState(DEVIN_CONFIG, baseQuotaStores.devinQuota, row.raw)
+             )
+           );
++        case DEVIN_OPENAI_CONFIG.type:
++          return toAccountQuotaRefreshOutcome(
++            await refreshWithConfig<DevinQuotaState, DevinQuotaData>(
++              DEVIN_OPENAI_CONFIG,
++              setDevinQuota,
++              getScopedQuotaState(DEVIN_OPENAI_CONFIG, baseQuotaStores.devinQuota, row.raw)
++            )
++          );
+         case META_CONFIG.type:
+           return toAccountQuotaRefreshOutcome(
+             await refreshWithConfig<MetaQuotaState, MetaQuotaData>(
+--- a/apps/web/src/features/accounts/model/accountHealthEvidence.test.ts
++++ b/apps/web/src/features/accounts/model/accountHealthEvidence.test.ts
+@@ -71,6 +71,25 @@
+ };
+ 
+ describe('accountHealthEvidence', () => {
++  it('does not let newer Devin seat quota erase an OpenAI gateway authentication failure', () => {
++    const row = makeRow({
++      provider: 'devin-openai',
++      quota: { ...makeRow().quota, status: 'ok', fetchedAtMs: 4_000 },
++    });
++    const evidence = resolveAccountRequestHealthEvidence({
++      recentRequests: [
++        makeRequest({
++          timestamp_ms: 3_000,
++          failed: true,
++          fail_status_code: 403,
++          fail_summary: 'unauthorized',
++        }),
++      ],
++    });
++    expect(isAccountRequestHealthEvidenceCurrent(row, evidence)).toBe(true);
++    expect(isAccountRequestCredentialEvidenceCurrent(row, evidence)).toBe(true);
++  });
++
+   it('keeps cancellation and request-shape failures neutral', () => {
+     expect(
+       classifyAccountRequestEvidence(
+--- a/apps/web/src/features/accounts/model/accountHealthEvidence.ts
++++ b/apps/web/src/features/accounts/model/accountHealthEvidence.ts
+@@ -217,15 +217,13 @@
+ };
+ 
+ const getConfirmedQuotaEvidenceObservedAtMs = (row: AccountRow): number => {
+-  if (
+-    row.quota.status !== 'ok' &&
+-    row.quota.status !== 'low' &&
+-    row.quota.status !== 'exhausted'
+-  ) {
++  // Seat quota is not evidence that the OpenAI gateway credential is authorized.
++  if (row.provider === 'devin-openai') return 0;
++  if (row.quota.status !== 'ok' && row.quota.status !== 'low' && row.quota.status !== 'exhausted') {
+     return 0;
+   }
+   return Math.max(row.quota.fetchedAtMs ?? 0, row.quota.observedQuotaAtMs ?? 0);
+-};
++};;
+ 
+ const getPositiveQuotaRefreshEvidenceObservedAtMs = (row: AccountRow): number =>
+   classifyAccountQuotaRefreshEvidence(row) === 'quota'
+--- a/apps/web/src/features/accounts/model/accountListPresentation.test.ts
++++ b/apps/web/src/features/accounts/model/accountListPresentation.test.ts
+@@ -97,6 +97,39 @@
+ });
+ 
+ describe('accountListPresentation', () => {
++  it.each([0, 75])(
++    'does not infer gateway availability from %s percent Devin seat quota',
++    (remainingPercent) => {
++      const row = makeRow({
++        provider: 'devin-openai',
++        quota: {
++          status: remainingPercent === 0 ? 'exhausted' : 'ok',
++          remainingPercent,
++          fetchedAtMs: 4_000,
++        },
++      });
++      const item = buildAccountListItem(row, {
++        quotaWindows: [
++          {
++            key: 'devin-openai:daily',
++            label: 'Daily',
++            kind: 'daily',
++            remainingPercent,
++            usedPercent: 100 - remainingPercent,
++            resetLabel: '-',
++            resetAtMs: null,
++            resetAccuracy: 'unknown',
++          },
++        ],
++      });
++      expect(item.health.status).toBe('raw');
++      const successful = buildAccountListItem(row, {
++        requestEvidence: { recentRequests: [{ timestamp_ms: 5_000, failed: false }] },
++      });
++      expect(successful.health.status).toBe('available');
++    }
++  );
++
+   it('attaches compact and full plan presentation to account list identity', () => {
+     const item = buildAccountListItem(
+       makeRow({
+--- a/apps/web/src/features/accounts/model/accountListPresentation.ts
++++ b/apps/web/src/features/accounts/model/accountListPresentation.ts
+@@ -607,6 +607,7 @@
+   quotaWindows: AccountListQuotaWindowPresentation[],
+   antigravityAvailability: AccountGroupedQuotaAvailabilitySummary | null
+ ): boolean => {
++  if (row.provider === 'devin-openai') return false;
+   if (antigravityAvailability) {
+     return (
+       antigravityAvailability.state === 'available' || antigravityAvailability.state === 'partial'
+@@ -777,15 +778,18 @@
+     requestCredentialEvidence?.direction !== 'positive';
+   const antigravityAvailability = resolveAntigravityAvailability(row, quotaWindows);
+   const resolveEffectiveQuotaWindowLimitKind = () =>
+-    antigravityAvailability
+-      ? antigravityAvailability.state !== 'exhausted'
+-        ? null
+-        : isSupportedLimitWindowKind(
+-              (antigravityAvailability.resetKind as AccountListQuotaWindowKind | undefined) ?? null
+-            )
+-          ? (antigravityAvailability.resetKind as AccountListSupportedLimitKind)
+-          : 'unknown'
+-      : resolveQuotaWindowLimitKind(quotaWindows);
++    row.provider === 'devin-openai'
++      ? null
++      : antigravityAvailability
++        ? antigravityAvailability.state !== 'exhausted'
++          ? null
++          : isSupportedLimitWindowKind(
++                (antigravityAvailability.resetKind as AccountListQuotaWindowKind | undefined) ??
++                  null
++              )
++            ? (antigravityAvailability.resetKind as AccountListSupportedLimitKind)
++            : 'unknown'
++        : resolveQuotaWindowLimitKind(quotaWindows);
+ 
+   if (authenticationProblem || providerStatusNeedsReauth) {
+     const authenticationSource =
+@@ -949,7 +953,10 @@
+     };
+   }
+ 
+-  if (row.quota.status === 'exhausted' || row.quota.remainingPercent === 0) {
++  if (
++    row.provider !== 'devin-openai' &&
++    (row.quota.status === 'exhausted' || row.quota.remainingPercent === 0)
++  ) {
+     return {
+       status: 'limited',
+       tooltipKey: 'accounts.health_tip_limited',
+--- a/apps/web/src/features/accounts/model/accountQuotaDisplayWindows.ts
++++ b/apps/web/src/features/accounts/model/accountQuotaDisplayWindows.ts
+@@ -44,6 +44,7 @@
+   | 'claude'
+   | 'antigravity'
+   | 'devin'
++  | 'devin-openai'
+   | 'kimi'
+   | 'meta'
+   | 'xai'
+@@ -855,7 +856,7 @@
+     if (windows.length) return windows;
+   }
+ 
+-  if (row.provider === 'devin') {
++  if (row.provider === 'devin' || row.provider === 'devin-openai') {
+     const windows = buildDevinQuotaDisplayWindows(row, options);
+     if (windows.length) return windows;
+   }
+@@ -890,7 +891,7 @@
+     const label = options.translateQuotaWindowLabel(undefined, labelKey);
+ 
+     return buildAccountQuotaDisplayWindow({
+-      key: `devin:${window.id}`,
++      key: `${row.provider}:${window.id}`,
+       label,
+       kind: window.id,
+       remainingPercent,
+@@ -899,7 +900,7 @@
+       resetAtMs: window.resetAtMs,
+       resetAccuracy: hasReset ? 'exact' : 'unknown',
+       limitWindowSeconds: window.periodHours * 3600,
+-      source: 'devin',
++      source: row.provider === 'devin-openai' ? 'devin-openai' : 'devin',
+       modelScope: { kind: 'all', complete: true },
+       observedAtMs: quota.observedAtMs ?? quota.fetchedAtMs ?? null,
+       nowMs: options.nowMs,
+--- a/apps/web/src/features/accounts/model/accountQuotaSnapshots.ts
++++ b/apps/web/src/features/accounts/model/accountQuotaSnapshots.ts
+@@ -603,7 +603,12 @@
+   );
+   return rows.flatMap((row) => {
+     const target = targets.get(row.selectionKey);
+-    if (!target || !['codex', 'claude', 'antigravity', 'kimi', 'xai', 'devin', 'meta'].includes(row.provider)) {
++    if (
++      !target ||
++      !['codex', 'claude', 'antigravity', 'kimi', 'xai', 'devin', 'devin-openai', 'meta'].includes(
++        row.provider
++      )
++    ) {
+       return [];
+     }
+     return [
+@@ -1074,7 +1079,8 @@
+     options.provider === 'kimi' ||
+     options.provider === 'meta' ||
+     options.provider === 'xai' ||
+-    options.provider === 'devin'
++    options.provider === 'devin' ||
++    options.provider === 'devin-openai'
+       ? options.provider
+       : 'summary';
+   const resetAtMs = snapshot.cycle_end_ms ?? null;
+--- a/apps/web/src/features/accounts/model/accountQuotaSummary.ts
++++ b/apps/web/src/features/accounts/model/accountQuotaSummary.ts
+@@ -1068,7 +1068,7 @@
+     });
+   }
+ 
+-  if (provider === 'devin') {
++  if (provider === 'devin' || provider === 'devin-openai') {
+     const quota = getCredentialScopedQuotaState(stores.devinQuota, file);
+     if (!quota) return emptyQuota(filePlanType);
+     const planType = quota.plan ?? filePlanType;
+--- a/apps/web/src/features/accounts/model/accountsPagePresentation.ts
++++ b/apps/web/src/features/accounts/model/accountsPagePresentation.ts
+@@ -784,6 +784,11 @@
+   let candidates: AccountQuotaDisplayWindow[];
+ 
+   switch (row.provider) {
++    case 'devin-openai':
++      candidates = quotaWindows.filter(
++        (window) => window.kind === 'daily' || window.kind === 'weekly'
++      );
++      break;
+     case 'codex':
+       candidates = selectCodexQuotaListWindows(quotaWindows);
+       break;
+--- /dev/null
++++ b/apps/web/src/features/accounts/model/devinOpenaiAccountQuota.test.ts
+@@ -0,0 +1,69 @@
++import { describe, expect, it } from 'vitest';
++import type { TFunction } from 'i18next';
++import { DEVIN_CONFIG, DEVIN_OPENAI_CONFIG } from '@/components/quota';
++import { buildAccountRows, type AccountQuotaStores } from './accountRows';
++import { buildAccountQuotaDisplayWindows } from './accountQuotaDisplayWindows';
++import { buildAccountQuotaSnapshotQueryAccounts } from './accountQuotaSnapshots';
++import { getQuotaCredentialStoreKey } from '@/utils/quota/credentialScope';
++import type { DevinQuotaData } from '@/types';
++
++describe('Devin OpenAI account quota identity', () => {
++  it('shows independent quota and snapshot identity alongside an existing Devin credential', () => {
++    const plugin = { name: 'gateway.json', type: 'devin-openai', authIndex: 'new-account' };
++    const legacy = { name: 'legacy.json', type: 'devin', authIndex: 'old-account' };
++    const other = { name: 'other.json', type: 'devin-openai', authIndex: 'other-account' };
++    const data: DevinQuotaData = {
++      windows: [
++        { id: 'daily', remainingPercent: 0, resetAtMs: null, periodHours: 24 },
++        { id: 'weekly', remainingPercent: 75, resetAtMs: null, periodHours: 168 },
++      ],
++      observedAtMs: Date.now(),
++      plan: 'Pro',
++      planStartMs: null,
++      planEndMs: null,
++    };
++    const stores: AccountQuotaStores = {
++      antigravityQuota: {},
++      claudeQuota: {},
++      codexQuota: {},
++      kimiQuota: {},
++      metaQuota: {},
++      xaiQuota: {},
++      devinQuota: {
++        [getQuotaCredentialStoreKey(plugin)]: DEVIN_OPENAI_CONFIG.buildSuccessState(data, plugin),
++        [getQuotaCredentialStoreKey(legacy)]: DEVIN_CONFIG.buildSuccessState(
++          { ...data, windows: data.windows.map((window) => ({ ...window, remainingPercent: 50 })) },
++          legacy
++        ),
++      },
++    };
++    const rows = buildAccountRows([plugin, legacy, other], stores);
++    expect(rows.map((row) => row.provider)).toEqual(['devin-openai', 'devin', 'devin-openai']);
++    expect(rows[0].quota.remainingPercent).toBe(0);
++    expect(rows[1].quota.remainingPercent).toBe(50);
++    expect(rows[2].quota.remainingPercent).toBeNull();
++    const windows = buildAccountQuotaDisplayWindows(rows[0], {
++      stores,
++      t: ((key: string) => key) as TFunction,
++      translateQuotaWindowLabel: (_label, key) => key ?? '',
++    });
++    expect(
++      windows.map((window) => ({
++        key: window.key,
++        source: window.source,
++        remaining: window.remainingPercent,
++      }))
++    ).toEqual([
++      { key: 'devin-openai:daily', source: 'devin-openai', remaining: 0 },
++      { key: 'devin-openai:weekly', source: 'devin-openai', remaining: 75 },
++    ]);
++    const accounts = buildAccountQuotaSnapshotQueryAccounts(rows);
++    expect(accounts.map((account) => account.provider)).toEqual([
++      'devin-openai',
++      'devin',
++      'devin-openai',
++    ]);
++    expect(accounts[0].account.auth_provider_snapshot).toBe('devin-openai');
++    expect(accounts[0].account.auth_index).toBe('new-account');
++  });
++});
+--- a/apps/web/src/features/authFiles/constants.ts
++++ b/apps/web/src/features/authFiles/constants.ts
+@@ -27,7 +27,15 @@
+ };
+ export type AuthFileIconAsset = string | { light: string; dark: string };
+ 
+-export type QuotaProviderType = 'antigravity' | 'claude' | 'codex' | 'kimi' | 'xai' | 'devin' | 'meta';
++export type QuotaProviderType =
++  | 'antigravity'
++  | 'claude'
++  | 'codex'
++  | 'kimi'
++  | 'xai'
++  | 'devin'
++  | 'devin-openai'
++  | 'meta';
+ export type OAuthConfigLoadState = 'loading' | 'ready' | 'unsupported' | 'error';
+ 
+ export const QUOTA_PROVIDER_TYPES = new Set<QuotaProviderType>([
+@@ -37,6 +45,7 @@
+   'kimi',
+   'xai',
+   'devin',
++  'devin-openai',
+   'meta',
+ ]);
+ 
+--- /dev/null
++++ b/apps/web/src/utils/quota/devinOpenaiQuota.test.ts
+@@ -0,0 +1,83 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import type { TFunction } from 'i18next';
++import { apiClient } from '@/services/api/client';
++import { fetchDevinOpenaiQuota, parseDevinOpenaiQuota } from './devinOpenaiQuota';
++
++const payload = () => ({
++  subscription: { plan: 'Pro' },
++  groups: [
++    {
++      buckets: [
++        { window: 'daily', remainingFraction: 0, resetTime: '2026-10-12T00:00:00Z' },
++        { window: 'weekly', remainingFraction: 0.75 },
++      ],
++    },
++  ],
++});
++
++afterEach(() => vi.restoreAllMocks());
++
++describe('Devin OpenAI plugin quota', () => {
++  it('maps depleted and remaining windows without inventing reset or plan dates', () => {
++    expect(parseDevinOpenaiQuota(payload())).toMatchObject({
++      plan: 'Pro',
++      planStartMs: null,
++      planEndMs: null,
++      windows: [
++        {
++          id: 'daily',
++          remainingPercent: 0,
++          resetAtMs: Date.parse('2026-10-12T00:00:00Z'),
++          periodHours: 24,
++        },
++        { id: 'weekly', remainingPercent: 75, resetAtMs: null, periodHours: 168 },
++      ],
++    });
++  });
++
++  it('rejects absent or invalid evidence instead of displaying zero quota', () => {
++    for (const value of [
++      null,
++      {},
++      { groups: [] },
++      { groups: [{ buckets: [{ window: 'daily' }] }] },
++    ]) {
++      expect(() => parseDevinOpenaiQuota(value)).toThrow();
++    }
++    for (const value of [-1, 1.5, '0.75', null]) {
++      const data = payload();
++      const malformed = {
++        ...data,
++        groups: [
++          { buckets: [{ window: 'daily', remainingFraction: value }, data.groups[0].buckets[1]] },
++        ],
++      };
++      expect(() => parseDevinOpenaiQuota(malformed)).toThrow();
++    }
++  });
++
++  it('uses the selected account and CPA connection without downloading its token', async () => {
++    const post = vi.spyOn(apiClient, 'post').mockResolvedValue(payload());
++    const scope = { apiBase: 'https://cpa.example', managementKey: 'test-management-key' };
++    await fetchDevinOpenaiQuota(
++      { name: 'gateway.json', type: 'devin-openai', authIndex: 'selected-index' },
++      ((key: string) => key) as TFunction,
++      scope
++    );
++    expect(post).toHaveBeenCalledWith(
++      '/plugins/devin-openai/quota',
++      { auth_index: 'selected-index' },
++      expect.objectContaining({
++        cpampScopedRequest: true,
++        headers: { Authorization: 'Bearer test-management-key' },
++      })
++    );
++    post.mockRejectedValueOnce(new Error('gateway quota unavailable'));
++    await expect(
++      fetchDevinOpenaiQuota(
++        { name: 'gateway.json', authIndex: 'selected-index' },
++        ((key: string) => key) as TFunction
++      )
++    ).rejects.toThrow('gateway quota unavailable');
++  });
++});
+--- /dev/null
++++ b/apps/web/src/utils/quota/devinOpenaiQuota.ts
+@@ -0,0 +1,72 @@
++import type { TFunction } from 'i18next';
++import type { AuthFileItem, DevinQuotaData, DevinQuotaWindow } from '@/types';
++import {
++  apiClient,
++  createScopedApiRequestConfig,
++  type ApiClientRequestScope,
++} from '@/services/api/client';
++import { isRecord } from '@/utils/helpers';
++import { normalizeAuthIndex } from './parsers';
++import { normalizeIsoTimestampMs, normalizePlanName } from './devinQuota';
++
++export const parseDevinOpenaiQuota = (payload: unknown): DevinQuotaData => {
++  if (!isRecord(payload) || !Array.isArray(payload.groups)) {
++    throw new Error('Invalid Devin OpenAI quota response');
++  }
++  const windows: DevinQuotaWindow[] = [];
++  for (const group of payload.groups) {
++    if (!isRecord(group) || !Array.isArray(group.buckets)) {
++      throw new Error('Invalid Devin OpenAI quota group');
++    }
++    for (const bucket of group.buckets) {
++      if (!isRecord(bucket) || (bucket.window !== 'daily' && bucket.window !== 'weekly')) {
++        throw new Error('Invalid Devin OpenAI quota window');
++      }
++      const fraction = bucket.remainingFraction;
++      if (
++        typeof fraction !== 'number' ||
++        !Number.isFinite(fraction) ||
++        fraction < 0 ||
++        fraction > 1 ||
++        windows.some((window) => window.id === bucket.window)
++      ) {
++        throw new Error('Invalid Devin OpenAI remaining quota');
++      }
++      const resetAtMs =
++        bucket.resetTime === undefined ? null : normalizeIsoTimestampMs(bucket.resetTime);
++      if (bucket.resetTime !== undefined && resetAtMs === null) {
++        throw new Error('Invalid Devin OpenAI quota reset time');
++      }
++      windows.push({
++        id: bucket.window,
++        remainingPercent: fraction * 100,
++        resetAtMs,
++        periodHours: bucket.window === 'daily' ? 24 : 168,
++      });
++    }
++  }
++  if (windows.length !== 2)
++    throw new Error('Devin OpenAI quota response is missing daily or weekly quota');
++  return {
++    windows,
++    observedAtMs: Date.now(),
++    plan: isRecord(payload.subscription) ? normalizePlanName(payload.subscription.plan) : null,
++    planStartMs: null,
++    planEndMs: null,
++  };
++};
++
++export const fetchDevinOpenaiQuota = async (
++  file: AuthFileItem,
++  t: TFunction,
++  requestScope?: ApiClientRequestScope
++): Promise<DevinQuotaData> => {
++  const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
++  if (!authIndex) throw new Error(t('devin_quota.missing_identity'));
++  const response = await apiClient.post<unknown>(
++    '/plugins/devin-openai/quota',
++    { auth_index: authIndex },
++    requestScope ? createScopedApiRequestConfig(requestScope) : undefined
++  );
++  return parseDevinOpenaiQuota(response);
++};
+--- /dev/null
++++ b/apps/manager-server/internal/service/quotasnapshot/devin_openai_test.go
+@@ -0,0 +1,38 @@
++package quotasnapshot
++
++import (
++	"context"
++	"testing"
++)
++
++func TestDevinOpenAIQuotaSnapshotKeepsProviderIdentity(t *testing.T) {
++	service := newQuotaSnapshotTestService(t, 20_000)
++	remaining := 75.0
++	account := AccountTarget{AuthFileSnapshot: "gateway.json", AuthProviderSnapshot: "devin-openai", AuthIndex: "gateway-account"}
++	_, err := service.Write(context.Background(), WriteRequest{Entries: []WriteEntry{{
++		RowKey: "gateway-row", Provider: "devin-openai", Account: account,
++		Windows: []WindowInput{{ProviderWindowID: "devin-openai:daily", WindowKind: "daily", WindowMode: "unknown", ModelScopeKind: "all", Source: "api_query", ObservedAtMS: 19_000, BoundaryAccuracy: "unknown", RemainingPercent: &remaining}},
++	}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	result, err := service.Query(context.Background(), QueryRequest{Accounts: []QueryAccount{{RowKey: "gateway-row", Provider: "devin-openai", Account: account}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(result.Items) != 1 || len(result.Items[0].Windows) != 1 {
++		t.Fatalf("missing gateway snapshot: %#v", result)
++	}
++	window := result.Items[0].Windows[0]
++	if window.ProviderWindowID != "devin-openai:daily" || window.RemainingPercent == nil || *window.RemainingPercent != 75 {
++		t.Fatalf("invalid gateway snapshot: %#v", window)
++	}
++	account.AuthProviderSnapshot = "devin"
++	legacy, err := service.Query(context.Background(), QueryRequest{Accounts: []QueryAccount{{RowKey: "legacy-row", Provider: "devin", Account: account}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(legacy.Items) != 1 || len(legacy.Items[0].Windows) != 0 {
++		t.Fatalf("gateway quota leaked into legacy provider: %#v", legacy)
++	}
++}
+--- a/apps/manager-server/internal/service/quotasnapshot/service.go
++++ b/apps/manager-server/internal/service/quotasnapshot/service.go
+@@ -29,7 +29,7 @@
+ )
+ 
+ var (
+-	validProviders      = stringSet("codex", "claude", "antigravity", "kimi", "xai", "devin", "meta")
++	validProviders      = stringSet("codex", "claude", "antigravity", "kimi", "xai", "devin", "devin-openai", "meta")
+ 	validModes          = stringSet("fixed", "calendar", "rolling", "non_window", "unknown")
+ 	validScopes         = stringSet("all", "family", "models", "product", "feature")
+ 	validSources        = stringSet("api_query", "response_header", "response_body", "inspection")
