@@ -109,7 +109,7 @@ func (p *plugin) handle(method string, raw []byte) (any, error) {
 	}
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
-		return map[string]any{"schema_version": 6, "metadata": map[string]any{"Name": provider, "Version": "0.1.0", "Author": "PomoAi", "GitHubRepository": "https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai", "ConfigFields": []any{}}, "capabilities": map[string]bool{"auth_provider": true, "model_provider": true}}, nil
+		return map[string]any{"schema_version": 6, "metadata": map[string]any{"Name": provider, "Version": "0.2.0", "Author": "PomoAi", "GitHubRepository": "https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai", "ConfigFields": []any{}}, "capabilities": map[string]bool{"auth_provider": true, "model_provider": true, "quota_provider": true}}, nil
 	case "plugin.quiesce", "plugin.shutdown":
 		p.mu.Lock()
 		clear(p.logins)
@@ -117,6 +117,8 @@ func (p *plugin) handle(method string, raw []byte) (any, error) {
 		return struct{}{}, nil
 	case "auth.identifier":
 		return map[string]string{"identifier": provider}, nil
+	case "quota.identifier", "quota.describe", "quota.fetch", "quota.reset":
+		return p.quota(method, raw)
 	case "auth.parse":
 		var kind struct{ Type string }
 		if json.Unmarshal(r.RawJSON, &kind) != nil {
@@ -282,8 +284,10 @@ func (p *plugin) http(callback, method, address, key string, body []byte) ([]byt
 }
 
 type model struct {
-	ID, Object, OwnedBy, DisplayName  string
-	InputTokenLimit, OutputTokenLimit int64
+	ID, Object, OwnedBy, DisplayName   string
+	InputTokenLimit, OutputTokenLimit  int64
+	ContextLength, MaxCompletionTokens int64
+	UserDefined                        bool
 }
 
 func parseModels(body []byte) ([]model, error) {
@@ -300,14 +304,15 @@ func parseModels(body []byte) ([]model, error) {
 		return nil, errors.New("invalid Devin model catalog")
 	}
 	models := make([]model, 0, len(list.Data))
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	for _, m := range list.Data {
 		if strings.TrimSpace(m.ID) == "" || m.Input < 0 || m.Output < 0 {
 			return nil, errors.New("invalid Devin model entry")
 		}
-		if !seen[m.ID] {
-			models = append(models, model{m.ID, "model", m.Owner, m.ID, m.Input, m.Output})
-			seen[m.ID] = true
+		if _, exists := seen[m.ID]; !exists {
+			seen[m.ID] = len(models)
+			// The gateway owns effort validation; absent capability data must not strip caller intent.
+			models = append(models, model{ID: m.ID, Object: "model", OwnedBy: m.Owner, DisplayName: m.ID, InputTokenLimit: m.Input, OutputTokenLimit: m.Output, ContextLength: m.Input, MaxCompletionTokens: m.Output, UserDefined: true})
 		}
 	}
 	for _, m := range list.Data {
@@ -315,9 +320,11 @@ func parseModels(body []byte) ([]model, error) {
 			if strings.TrimSpace(v.UID) == "" || strings.TrimSpace(v.Name) == "" {
 				return nil, errors.New("invalid Devin model variant")
 			}
-			if !seen[v.UID] {
-				models = append(models, model{v.UID, "model", m.Owner, v.Name, m.Input, m.Output})
-				seen[v.UID] = true
+			if index, exists := seen[v.UID]; exists {
+				models[index].DisplayName = v.Name
+			} else {
+				seen[v.UID] = len(models)
+				models = append(models, model{ID: v.UID, Object: "model", OwnedBy: m.Owner, DisplayName: v.Name, InputTokenLimit: m.Input, OutputTokenLimit: m.Output, ContextLength: m.Input, MaxCompletionTokens: m.Output, UserDefined: true})
 			}
 		}
 	}

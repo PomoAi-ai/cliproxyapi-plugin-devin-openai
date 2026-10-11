@@ -2,6 +2,7 @@
 """Verify a real CPA host against a loopback-only fake Devin gateway."""
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,27 @@ TOOL = {"type": "function", "function": {"name": "inspect", "parameters": {
     "type": "object", "properties": {"path": {"type": "string"}}}}}
 CALL = {"id": "call_local", "type": "function", "function": {
     "name": "inspect", "arguments": '{"path":"sample"}'}}
+QUOTA_PATH = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
+RESET_DAILY, RESET_WEEKLY = 2000000000, 2000600000
+SESSION_KEY = "devin-session-token$dummy-a"
+
+
+def varint(value):
+    result = bytearray()
+    while value > 127:
+        result.append((value & 127) | 128)
+        value >>= 7
+    return bytes(result) + bytes([value])
+
+
+def proto_bytes(field, value):
+    return varint(field * 8 + 2) + varint(len(value)) + value
+
+
+def quota_response():
+    plan = b"".join(varint(field * 8) + varint(value) for field, value in (
+        (14, 75), (15, 0), (17, RESET_DAILY), (18, RESET_WEEKLY)))
+    return proto_bytes(1, proto_bytes(13, plan))
 
 
 def content_text(content):
@@ -34,7 +56,7 @@ class Gateway(BaseHTTPRequestHandler):
         pass
 
     def reply(self, status, body, content_type="application/json"):
-        raw = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        raw = body if isinstance(body, bytes) else body.encode() if isinstance(body, str) else json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
@@ -45,7 +67,7 @@ class Gateway(BaseHTTPRequestHandler):
         self.reply(502, {"error": "external network forbidden by local verifier"})
 
     def account(self):
-        return {"Bearer dummy-a": "a", "Bearer dummy-b": "b"}.get(
+        return {f"Bearer {SESSION_KEY}": "a", "Bearer dummy-b": "b"}.get(
             self.headers.get("Authorization"))
 
     def do_GET(self):
@@ -67,7 +89,14 @@ class Gateway(BaseHTTPRequestHandler):
         if target.hostname and target.hostname != "127.0.0.1":
             self.reply(502, {"error": "external network forbidden by local verifier"})
             return
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        if target.path == QUOTA_PATH:
+            valid = (self.headers.get("Authorization") == f"Basic {SESSION_KEY}-{SESSION_KEY}"
+                     and SESSION_KEY.encode() in raw and self.headers.get("Connect-Protocol-Version") == "1")
+            self.records.append(("a", "quota", valid))
+            self.reply(200 if valid else 401, quota_response() if valid else b"invalid test session", "application/proto")
+            return
+        body = json.loads(raw)
         account = self.account()
         self.records.append((account, target.path, body))
         if target.path != "/api/v1/chat/completions" or not account:
@@ -82,6 +111,8 @@ class Gateway(BaseHTTPRequestHandler):
         has_result = body["messages"][-1]["role"] == "tool"
         message = {"role": "assistant", "content": f"done-{account}"} if has_result else {
             "role": "assistant", "content": None, "tool_calls": [CALL]}
+        if body.get("reasoning_effort"):
+            message["reasoning_content"] = "local reasoning"
         finish = "stop" if has_result else "tool_calls"
         response = {"id": "chatcmpl-local", "object": "chat.completion", "created": 1,
                     "model": body["model"], "choices": [{"index": 0, "message": message,
@@ -93,9 +124,15 @@ class Gateway(BaseHTTPRequestHandler):
                 delta["tool_calls"] = [{"index": 0, **CALL}]
             response["object"] = "chat.completion.chunk"
             response["choices"] = [{"index": 0, "delta": delta, "finish_reason": None}]
-            first = json.dumps(response)
+            chunks = []
+            if "reasoning_content" in delta:
+                response["choices"][0]["delta"] = {"role": "assistant", "reasoning_content": delta.pop("reasoning_content")}
+                chunks.append(json.dumps(response))
+                response["choices"][0]["delta"] = delta
+            chunks.append(json.dumps(response))
             response["choices"] = [{"index": 0, "delta": {}, "finish_reason": finish}]
-            self.reply(200, f"data: {first}\n\ndata: {json.dumps(response)}\n\ndata: [DONE]\n\n",
+            chunks.append(json.dumps(response))
+            self.reply(200, "".join(f"data: {chunk}\n\n" for chunk in chunks) + "data: [DONE]\n\n",
                        "text/event-stream")
         else:
             self.reply(200, response)
@@ -116,7 +153,7 @@ def verify(host, plugin):
             shutil.copy2(plugin, root / "plugins" / plugin.name)
             for account in ("a", "b"):
                 (root / "auth" / f"{account}.json").write_text(json.dumps({
-                    "type": "devin-openai", "api_key": f"dummy-{account}",
+                    "type": "devin-openai", "api_key": SESSION_KEY if account == "a" else "dummy-b",
                     "label": f"local-{account}", "inference_url": origin,
                     "proxy_url": "direct", "disabled": False}))
             with socket.socket() as port_socket:
@@ -125,7 +162,7 @@ def verify(host, plugin):
             config = {
                 "config-version": 8, "server": {"host": "127.0.0.1", "port": port,
                     "discovery": {"enabled": False}},
-                "management": {"disable-control-panel": True, "disable-auto-update-panel": True},
+                "management": {"secret-key": "dummy-management", "disable-control-panel": True, "disable-auto-update-panel": True},
                 "access": {"api-keys": ["dummy-client"]}, "oauth": {"auth-dir": str(root / "auth")},
                 "plugins": {"enabled": True, "dir": str(root / "plugins"),
                             "configs": {"devin-openai": {"enabled": True}}},
@@ -140,9 +177,10 @@ def verify(host, plugin):
                        ALL_PROXY=origin, NO_PROXY="127.0.0.1,localhost")
 
             def request(path, body=None):
+                key = "dummy-management" if path.startswith("/v8/management/") else "dummy-client"
                 req = Request(f"http://127.0.0.1:{port}{path}",
                               data=None if body is None else json.dumps(body).encode(),
-                              headers={"Authorization": "Bearer dummy-client", "Content-Type": "application/json"})
+                              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
                 try:
                     with opener.open(req, timeout=10) as response:
                         return response.status, response.read().decode()
@@ -215,7 +253,68 @@ def verify(host, plugin):
                         if body["messages"][-1]["role"] == "tool":
                             assert body["messages"][-1]["tool_call_id"] == CALL["id"], body
                             assert content_text(body["messages"][-1]["content"]) == "sample result", body
-                    print("PASS: real CPA plugin loading, per-account models/credentials, Chat and Messages tool roundtrips, SSE, and upstream 403")
+                    # These requests fail if the model catalog strips user-specified reasoning effort.
+                    chat = {"model": "devin-openai/local-b", "messages": [{"role": "user", "content": "inspect"}], "tools": [TOOL]}
+                    for extra, effort in (({"reasoning_effort": "high"}, "high"),
+                                          ({"model": "devin-openai/local-b(high)"}, "high")):
+                        status, raw = request("/v1/chat/completions", {**chat, **extra})
+                        assert status == 200 and "local reasoning" in raw, (status, raw)
+                        assert Gateway.records[-1][2]["reasoning_effort"] == effort, Gateway.records[-1]
+                    messages = {"model": "devin-openai/local-b", "max_tokens": 12000,
+                                "messages": [{"role": "user", "content": "inspect"}],
+                                "tools": [{"name": "inspect", "input_schema": TOOL["function"]["parameters"]}]}
+                    for extra, effort in (({"thinking": {"type": "enabled", "budget_tokens": 8192}}, "medium"),
+                                          ({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}, "high")):
+                        status, raw = request("/v1/messages", {**messages, **extra})
+                        assert status == 200 and "local reasoning" in raw, (status, raw)
+                        assert Gateway.records[-1][2]["reasoning_effort"] == effort, Gateway.records[-1]
+                    messages.update(stream=True, thinking={"type": "adaptive"}, output_config={"effort": "high"})
+                    status, raw = request("/v1/messages", messages)
+                    assert status == 200, (status, raw)
+                    events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+                    assert any(e["type"] == "message_stop" for e in events), events
+                    blocks = {}
+                    tool_json = ""
+                    for event in events:
+                        if event["type"] == "content_block_start":
+                            blocks[event["index"]] = event["content_block"]
+                        elif event["type"] == "content_block_delta":
+                            delta = event["delta"]
+                            if delta["type"] == "thinking_delta":
+                                block = blocks[event["index"]]
+                                block["thinking"] = block.get("thinking", "") + delta["thinking"]
+                            elif delta["type"] == "input_json_delta":
+                                tool_json += delta["partial_json"]
+                    thinking = next(b for b in blocks.values() if b["type"] == "thinking")
+                    tool = next(b for b in blocks.values() if b["type"] == "tool_use")
+                    assert thinking["thinking"] == "local reasoning" and tool["id"] == CALL["id"], blocks
+                    tool["input"] = json.loads(tool_json)
+                    assert tool["input"] == {"path": "sample"}, tool
+                    messages["messages"].extend([{"role": "assistant", "content": list(blocks.values())},
+                        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": CALL["id"], "content": "sample result"}]}])
+                    status, raw = request("/v1/messages", messages)
+                    assert status == 200 and "done-b" in raw, (status, raw)
+                    upstream = Gateway.records[-1][2]
+                    assert upstream["reasoning_effort"] == "high", upstream
+                    assert upstream["messages"][-1]["tool_call_id"] == CALL["id"], upstream
+                    assert content_text(upstream["messages"][-1]["content"]) == "sample result", upstream
+                    print("OBSERVED: unsigned thinking history forwarded =", any(
+                        "reasoning_content" in message for message in upstream["messages"][:-1]))
+
+                    status, raw = request("/v8/management/credentials")
+                    assert status == 200, (status, raw)
+                    auths = {a["name"]: a["auth_index"] for a in json.loads(raw)["files"]}
+                    status, raw = request("/v8/management/plugins/devin-openai/quota", {"auth_index": auths["a.json"]})
+                    assert status == 200, (status, raw)
+                    buckets = {b["window"]: b for g in json.loads(raw)["groups"] for b in g["buckets"]}
+                    for window, fraction, reset in (("daily", .75, RESET_DAILY), ("weekly", 0, RESET_WEEKLY)):
+                        assert buckets[window]["remainingFraction"] == fraction, buckets
+                        assert buckets[window]["resetTime"] == datetime.fromtimestamp(reset, timezone.utc).isoformat().replace("+00:00", "Z"), buckets
+                    assert any(path == "quota" and valid for _, path, valid in Gateway.records), Gateway.records
+                    status, raw = request("/v8/management/plugins/devin-openai/quota", {"auth_index": auths["b.json"]})
+                    assert status == 502 and "session token" in raw, (status, raw)
+                    assert not any(secret in raw for secret in (SESSION_KEY, "dummy-b")), raw
+                    print("PASS: real CPA loading, account isolation, Chat/Messages tools and SSE, 403, reasoning effort/budget/suffix, thinking SSE, and quota 75%/0% with resets")
                 except BaseException:
                     log.flush()
                     log.seek(0)

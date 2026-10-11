@@ -77,6 +77,32 @@ func TestCatalogTracksAccountResponse(t *testing.T) {
 	}
 }
 
+// Variant metadata must not overwrite a concrete model's own limits or hide its display name.
+func TestConcreteVariantKeepsOwnLimits(t *testing.T) {
+	models, err := parseModels([]byte(`{"data":[
+		{"id":"family","max_input_tokens":200000,"max_output_tokens":64000,"available_variants":[{"uid":"concrete","name":"Claude High"},{"uid":"variant-only","name":"Claude Fast"}]},
+		{"id":"concrete","max_input_tokens":100000,"max_output_tokens":32000}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 3 {
+		t.Fatal(models)
+	}
+	concrete := models[1]
+	if concrete.DisplayName != "Claude High" || concrete.ContextLength != 100000 || concrete.MaxCompletionTokens != 32000 || concrete.InputTokenLimit != 100000 || concrete.OutputTokenLimit != 32000 {
+		t.Fatal(concrete)
+	}
+	if models[2].DisplayName != "Claude Fast" || models[2].ContextLength != 200000 {
+		t.Fatal(models[2])
+	}
+	for _, m := range models {
+		if !m.UserDefined {
+			t.Fatalf("gateway model %s would lose caller effort", m.ID)
+		}
+	}
+}
+
 // Replay, expiry, state mismatch, or missing PKCE verification must not mint credentials.
 func TestPKCECallbackConsumedOnce(t *testing.T) {
 	calls := 0

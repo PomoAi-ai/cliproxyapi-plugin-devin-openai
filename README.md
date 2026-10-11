@@ -2,7 +2,7 @@
 
 为 CLIProxyAPI v8.0.23 添加独立的 `devin-openai` provider，通过 Devin OpenAI-compatible 网关调用模型。它不替换 CPA 内置的 `devin` Connect-RPC 通道。
 
-实现仅包含认证与模型发现；推理由 CPA 原生 OpenAICompatExecutor 负责，包括协议转换、流式响应、工具调用、用量统计和账号调度。不增加自己的代理服务。
+插件提供认证、模型发现和账号额度查询；推理由 CPA 原生 OpenAICompatExecutor 负责，包括协议转换、流式响应、工具调用、用量统计和账号调度。不增加自己的代理服务。
 
 ## 社区核查
 
@@ -77,6 +77,26 @@ plugins:
 
 管理面板对自定义 provider 的 UI 支持取决于面板版本；上述管理 API 是确定的入口，不承诺现有 CPAMP 会额外出现登录按钮。
 
+## 额度查询
+
+从 0.2.0 起提供 CPA `QuotaProvider`：查询 Devin seat-management 的日／周剩余百分比、重置时间及套餐名称。该信息属于账号套餐额度，**不是 AI Gateway 独立余额，也不证明账号具有网关权限**。即使额度有剩余，模型目录或推理仍可能因缺少 AI Gateway 权限返回 403。
+
+额度查询只支持 `devin-session-token$…` 凭据；service key 尚无已确认的额度协议，会明确返回不支持。插件不提供额度重置功能。上游错误或损坏响应会报错，不伪装为成功或无限额度。
+
+管理端可通过 `GET /v8/management/plugins` 发现 `supports_quota` 和 `quota_provider`，再按 CPA 的插件额度接口传入目标账号 `auth_index` 查询。面板能否自动显示入口取决于其对通用插件额度的支持。
+
+在 CPA v8.0.23 中，可先通过 `GET /v8/management/credentials` 获取账号的 `auth_index`，再调用 `POST /v8/management/plugins/devin-openai/quota`，正文为 `{"auth_index":"目标账号索引"}`。两步均需管理认证。返回的 `groups[].buckets[]` 包含 `remainingFraction`（0 到 1）和可选 `resetTime`（UTC）。
+
+## Claude Messages 与思考参数
+
+Claude API 客户端可使用 CPA 的 `/v1/messages`，选择 `devin-openai/<模型ID>`；CPA 将请求转换为网关使用的 OpenAI Chat Completions，并转换返回的工具调用、流式内容及 reasoning。它不意味着网关提供原生 Anthropic `/messages` 端点。
+
+模型目录没有声明可接受的 thinking budget 或 reasoning effort 范围。插件将这些模型标记为 CPA 自定义模型，让 CPA 保留用户显式思考意图并交给上游验证，不再因缺少 `Thinking` 声明而删除参数。Claude 的 `thinking` / `output_config.effort` 由 CPA 按其现有规则转换；不同协议的预算不保证逐 token 等价。
+
+网关 `available_variants` 中的 UID 是实际模型选择。插件保留其 UID、展示名及上下文限制，不根据 High/Fast 等名称编造 effort 档位。需要指定某个变体时直接选该 UID；参数被保留不代表上游一定接受它。
+
+CPA v8.0.23 的转换存在边界：网关 reasoning 可以转换为 Claude thinking 内容，但不会生成 Anthropic 原生签名；无签名 thinking 历史再次提交时可能被宿主过滤。因此不能承诺 Claude 原生签名或完整 thinking 历史无损往返。
+
 ## 代理与安全边界
 
 - 登录换 token 和模型目录使用宿主 `host.http.do`，遵循 CPA **全局代理**。v8.0.23 的该 C ABI 回调不会应用账号级 `proxy_url`。
@@ -87,7 +107,7 @@ plugins:
 
 ## 本地开发验证
 
-插件仅使用 Go 标准库，C ABI 不依赖宿主 Go module。模块最低声明 Go 1.22，需要 C 编译器；本次开发检查使用 Go 1.25.1。
+插件 C ABI 不依赖宿主 Go module；额度协议使用 `google.golang.org/protobuf/encoding/protowire` 解析二进制字段。模块最低声明 Go 1.22，需要 C 编译器；本次开发检查使用 Go 1.25.1。
 
 ```sh
 go test ./...
@@ -113,6 +133,8 @@ uv run --no-project python3 tools/verify_host.py \
 - 系统提示内容、工具 ID 和结果保留，上游 403 明确返回。
 
 另已验证 CI 构建的 Linux amd64 动态库可由 CPA v8.0.23 热加载，管理接口确认注册、启用和 OAuth 能力。
+
+0.2.0 的扩展验证通过 17 次本地模拟推理请求及额度查询：额外检查显式 effort、模型后缀 effort、Claude budget/adaptive 转换、Messages thinking SSE 与工具往返，以及日 75%／周 0% 的剩余额度和重置时间。service key 查询额度明确失败且不泄露凭据。
 
 这些检查覆盖插件接入和协议传递；尚未验证真实 Devin 登录、网关账号权益，或 Claude Code/OpenCode 的实际 subagent 端到端任务。
 
