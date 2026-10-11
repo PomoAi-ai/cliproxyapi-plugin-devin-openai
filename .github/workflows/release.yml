@@ -1,0 +1,81 @@
+name: Release v0.2.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-v0.2.0
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: golang:1.25.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v0.2.0
+      - name: Validate release source
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git describe --tags --exact-match)" = v0.2.0
+          grep -F '"Version": "0.2.0"' plugin.go
+          test -s LICENSE
+          test -s THIRD_PARTY_NOTICES.md
+      - name: Build Linux amd64 shared library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -buildmode=c-shared -o dist/devin-openai.so .
+          nm -D --defined-only dist/devin-openai.so | grep ' cliproxy_plugin_init$'
+          objdump -T dist/devin-openai.so | grep GLIBC_ | sed -E 's/.*\((GLIBC_[^)]+)\).*/\1/' | sort -Vu
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-amd64
+          path: |
+            dist/devin-openai.so
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v0.2.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-amd64
+          path: dist
+      - name: Package and validate release assets
+        working-directory: dist
+        run: |
+          file devin-openai.so | grep -E 'ELF 64-bit LSB shared object, x86-64'
+          zip devin-openai_0.2.0_linux_amd64.zip devin-openai.so LICENSE THIRD_PARTY_NOTICES.md
+          printf '%s\n' LICENSE THIRD_PARTY_NOTICES.md devin-openai.so > expected-files.txt
+          unzip -Z1 devin-openai_0.2.0_linux_amd64.zip | LC_ALL=C sort > actual-files.txt
+          diff -u expected-files.txt actual-files.txt
+          sha256sum devin-openai_0.2.0_linux_amd64.zip > checksums.txt
+          sha256sum --check checksums.txt
+      - name: Publish GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create v0.2.0 --verify-tag \
+            --title 'Devin OpenAI v0.2.0' \
+            --notes-file ../releases/v0.2.0.md \
+            devin-openai_0.2.0_linux_amd64.zip checksums.txt

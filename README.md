@@ -42,7 +42,7 @@ plugins:
 
 插件文件应命名为 `devin-openai.dylib`（macOS）或 `devin-openai.so`（Linux），放在宿主插件目录。使用支持动态库的 CPA 发行包，不能使用 `no-plugin` 包。
 
-源码仓库为 [PomoAi-ai/cliproxyapi-plugin-devin-openai](https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai)，插件元数据指向此地址。当前提供源码，尚未提供 Release 动态库或登记插件商店，不承诺商店安装或在线更新。
+源码仓库为 [PomoAi-ai/cliproxyapi-plugin-devin-openai](https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai)，插件元数据指向此地址。[v0.2.0 Release](https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai/releases/tag/v0.2.0) 提供 Linux amd64 安装包与 `checksums.txt`，按官方插件商店格式发布。商店可发现性取决于官方 registry PR 是否合并；上架不等于官方背书。
 
 不要为此 provider 再添加 `openai-compatibility` 配置；认证解析会提供 `base_url` 和 `api_key`，宿主为独立 provider 选择原生转发器。插件不设置 `compat_name`，避免 CPA 将执行器归入另一命名空间而与按账号注册的模型不匹配。
 
@@ -140,10 +140,16 @@ uv run --no-project python3 tools/verify_host.py \
 
 ## Linux 构建产物
 
+正式安装优先使用 [GitHub Releases](https://github.com/PomoAi-ai/cliproxyapi-plugin-devin-openai/releases)。下载 `devin-openai_0.2.0_linux_amd64.zip` 与 `checksums.txt` 后执行 `sha256sum -c checksums.txt`；ZIP 根目录包含动态库和许可声明。该构建要求 glibc ≥2.34，不适用于纯 musl/Alpine 环境；其他架构尚未发布。
+
+维护者通过 `Release v0.2.0` 手动 CI 工作流从固定标签构建和发布，发行包不在开发机生成。下述旧构建工作流仅用于开发工件，不替代正式 Release。
+
 在 GitHub Actions 手动运行 `Build Linux plugin`，成功后下载 `devin-openai-linux-amd64` artifact，包含 `devin-openai.so` 和 `SHA256SUMS`。编译使用 Go 1.25.1 / Debian 12，仅支持 Linux amd64；安装前运行 `sha256sum -c SHA256SUMS`。
 
 全局插件已启用时，将动态库放到 `<plugins.dir>/linux/amd64/devin-openai.so`，再通过管理认证调用 `PATCH /v0/management/plugins/devin-openai/enabled`，请求体为 `{"enabled":true}`，即可触发热加载。通过 `GET /v8/management/plugins` 确认 `registered`、`effective_enabled`、`supports_oauth` 均为 `true`。单独停用该插件时将 enabled 改为 false。
 
 升级已有插件时，不覆盖正在加载的动态库：将新库放到版本化路径，例如 `devin-openai-v0.2.0.so`。单独停用该插件并确认 `effective_enabled=false` 后重新启用，核对元数据版本与 `supports_quota=true`；重复提交相同的 enabled=true 配置不保证触发重新加载。保留旧库及配置备份供回退。
 
-发布采用获授权后的 CI/CD 构建；这里没有创建发布包、镜像或自动部署流程，也没有将测试加入 CI。
+发布采用 CI/CD 构建，CI 不运行测试。CPAMP 的额度 UI 适配见 [integrations/cpamp](integrations/cpamp)，属于独立管理面板补丁，不会随 CPA 插件商店安装自动生效。
+
+本项目使用 [MIT License](LICENSE)，依赖和参考实现的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
