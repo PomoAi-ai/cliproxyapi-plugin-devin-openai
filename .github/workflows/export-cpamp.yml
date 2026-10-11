@@ -1,0 +1,46 @@
+name: Export CPAMP image
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: Published CPAMP image digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export published image
+        env:
+          IMAGE_DIGEST: ${{ inputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image="ghcr.io/pomoai-ai/cpamp-devin-openai@$IMAGE_DIGEST"
+          docker pull --platform linux/amd64 "$image"
+          image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+          docker tag "$image_id" cpamp-devin-openai:ci-export
+          docker save cpamp-devin-openai:ci-export -o cpamp-image.tar
+          printf '%s\n' "$image_id" > image-id.txt
+          printf '%s\n' "$image" > registry-reference.txt
+          sha256sum cpamp-image.tar > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpamp-image-linux-amd64
+          path: |
+            cpamp-image.tar
+            image-id.txt
+            registry-reference.txt
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
