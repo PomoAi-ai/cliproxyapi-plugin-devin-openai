@@ -144,4 +144,6 @@ uv run --no-project python3 tools/verify_host.py \
 
 全局插件已启用时，将动态库放到 `<plugins.dir>/linux/amd64/devin-openai.so`，再通过管理认证调用 `PATCH /v0/management/plugins/devin-openai/enabled`，请求体为 `{"enabled":true}`，即可触发热加载。通过 `GET /v8/management/plugins` 确认 `registered`、`effective_enabled`、`supports_oauth` 均为 `true`。单独停用该插件时将 enabled 改为 false。
 
+升级已有插件时，不覆盖正在加载的动态库：将新库放到版本化路径，例如 `devin-openai-v0.2.0.so`。单独停用该插件并确认 `effective_enabled=false` 后重新启用，核对元数据版本与 `supports_quota=true`；重复提交相同的 enabled=true 配置不保证触发重新加载。保留旧库及配置备份供回退。
+
 发布采用获授权后的 CI/CD 构建；这里没有创建发布包、镜像或自动部署流程，也没有将测试加入 CI。
