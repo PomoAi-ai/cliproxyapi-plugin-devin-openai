@@ -1,0 +1,32 @@
+name: Build Linux plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: golang:1.25.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Linux amd64 shared library
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -buildmode=c-shared -o dist/devin-openai.so .
+          cd dist
+          sha256sum devin-openai.so > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devin-openai-linux-amd64
+          path: |
+            dist/devin-openai.so
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
